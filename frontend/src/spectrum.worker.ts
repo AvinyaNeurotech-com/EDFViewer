@@ -3,11 +3,11 @@ import { derivedSample } from './edf'
 import type { EdfHeader } from './edf'
 import { selectionInputs } from './montage'
 import type { ChannelSelection } from './montage'
-import { canFilterSamples, filterSamples } from './signalFilters'
-import type { FilterSettings } from './signalFilters'
+import { canFilterSamples, channelFilters, filterSamples } from './signalFilters'
+import type { ChannelFilters } from './signalFilters'
 
 type Request = { name: string; header: EdfHeader; channel: ChannelSelection;
-  start: number; end: number; filters: FilterSettings }
+  start: number; end: number; filters: ChannelFilters }
 
 function fft(real: Float64Array, imaginary: Float64Array,
   cosines: Float64Array, sines: Float64Array) {
@@ -40,6 +40,7 @@ function fft(real: Float64Array, imaginary: Float64Array,
 self.onmessage = async (event: MessageEvent<Request>) => {
   const { name, header, channel, start, end, filters } = event.data
   try {
+    const settings = channelFilters(header, channel, filters)
     const source = header.signals[typeof channel === 'number' ? channel : channel.source]
     const inputs = selectionInputs(channel)
     const rate = source.samplesPerRecord / header.recordDuration
@@ -54,8 +55,8 @@ self.onmessage = async (event: MessageEvent<Request>) => {
     const lastSample = Math.min(header.recordCount * source.samplesPerRecord, Math.ceil(end * rate))
     if (lastSample - firstSample < rate * 0.5) throw new Error('Select at least 0.5 seconds')
 
-    const filter = canFilterSamples(rate, filters)
-    const padding = filter ? Math.max(2, filters.highpass ? (filters.order === 4 ? 6 : 4) / filters.highpass : 0) : 0
+    const filter = canFilterSamples(rate, settings)
+    const padding = filter ? Math.max(2, settings.highpass ? (settings.order === 4 ? 6 : 4) / settings.highpass : 0) : 0
     const firstRecord = Math.max(0, Math.floor((start - padding) / header.recordDuration))
     const lastRecord = Math.min(header.recordCount - 1, Math.ceil((end + padding) / header.recordDuration) - 1)
     const byteStart = header.headerBytes + firstRecord * header.recordBytes
@@ -73,7 +74,7 @@ self.onmessage = async (event: MessageEvent<Request>) => {
       allSamples[index] = derivedSample(view, header, Math.floor(index / recordSamples),
         index % recordSamples, inputs)
     }
-    const samples = filter ? filterSamples(allSamples, rate, filters) : allSamples
+    const samples = filter ? filterSamples(allSamples, rate, settings) : allSamples
     const from = firstSample - firstRecord * recordSamples
     const count = lastSample - firstSample
     const length = 2 ** Math.floor(Math.log2(Math.min(count, rate * 2, 4096)))

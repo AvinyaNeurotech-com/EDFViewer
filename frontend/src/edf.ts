@@ -1,5 +1,5 @@
-import { canFilterSamples, filterSamples, NO_FILTERS } from './signalFilters'
-import type { FilterSettings } from './signalFilters'
+import { canFilterSamples, channelFilters, filterSamples, NO_FILTERS } from './signalFilters'
+import type { ChannelFilters } from './signalFilters'
 import { selectionInputs } from './montage'
 import type { ChannelSelection } from './montage'
 
@@ -162,7 +162,7 @@ export function decodeWindow(
   duration: number,
   columns: number,
   channels: ChannelSelection[] = header.visibleSignals,
-  filters: FilterSettings = NO_FILTERS,
+  filters: ChannelFilters = { eeg: NO_FILTERS, ecg: NO_FILTERS, aux: NO_FILTERS },
 ): Trace[] {
   const view = new DataView(data)
   return channels.map((selection) => {
@@ -171,9 +171,10 @@ export function decodeWindow(
     const inputs = selectionInputs(selection)
     const recordCount = data.byteLength / header.recordBytes
     const sampleRate = signal.samplesPerRecord / header.recordDuration
+    const settings = channelFilters(header, selection, filters)
     const mode = traceMode(sampleRate, duration, columns)
     let filtered: Float32Array | null = null
-    if (canFilterSamples(sampleRate, filters)) {
+    if (canFilterSamples(sampleRate, settings)) {
       const samples = new Float32Array(recordCount * signal.samplesPerRecord)
       for (let recordOffset = 0; recordOffset < recordCount; recordOffset++) {
         for (let sample = 0; sample < signal.samplesPerRecord; sample++) {
@@ -181,7 +182,7 @@ export function decodeWindow(
             derivedSample(view, header, recordOffset, sample, inputs)
         }
       }
-      filtered = filterSamples(samples, sampleRate, filters)
+      filtered = filterSamples(samples, sampleRate, settings)
     }
     const drawAll = mode === 'four-point' && sampleRate * duration <= columns
     const rawPositions = drawAll ? new Float32Array(recordCount * signal.samplesPerRecord) : null

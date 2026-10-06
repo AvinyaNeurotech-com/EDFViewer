@@ -1,8 +1,8 @@
 import { decodeWindow, headerLength, parseHeader } from './edf'
 import type { EdfHeader } from './edf'
 import { RecordCache } from './recordCache'
-import { canFilterSamples } from './signalFilters'
-import type { FilterSettings } from './signalFilters'
+import { canFilterSamples, channelFilters } from './signalFilters'
+import type { ChannelFilters } from './signalFilters'
 import type { ChannelSelection } from './montage'
 
 let header: EdfHeader | null = null
@@ -23,7 +23,7 @@ async function readRange(start: number, end: number, signal: AbortSignal,
 self.onmessage = async (event: MessageEvent<
   | { type: 'open'; name: string; size: number }
   | { type: 'window'; start: number; duration: number; columns: number; requestId: number;
-      channels: ChannelSelection[]; filters: FilterSettings }
+      channels: ChannelSelection[]; filters: ChannelFilters }
   | { type: 'analysis'; start: number; duration: number; requestId: number }
 >) => {
   if (event.data.type === 'analysis') {
@@ -58,11 +58,14 @@ self.onmessage = async (event: MessageEvent<
     } else if (header && cache) {
       const { start, duration, columns, requestId, channels, filters } = event.data
       const currentHeader = header
-      const hasFilterableChannel = channels.some((channel) => canFilterSamples(
-        currentHeader.signals[typeof channel === 'number' ? channel : channel.source].samplesPerRecord /
-        currentHeader.recordDuration, filters))
-      const padding = hasFilterableChannel
-        ? Math.max(2, filters.highpass ? (filters.order === 4 ? 6 : 4) / filters.highpass : 0) : 0
+      const padding = channels.reduce<number>((maximum, channel) => {
+        const settings = channelFilters(currentHeader, channel, filters)
+        const rate = currentHeader.signals[typeof channel === 'number' ? channel : channel.source].samplesPerRecord /
+          currentHeader.recordDuration
+        return canFilterSamples(rate, settings)
+          ? Math.max(maximum, 2, settings.highpass ? (settings.order === 4 ? 6 : 4) / settings.highpass : 0)
+          : maximum
+      }, 0)
       const first = Math.max(0, Math.floor((start - padding) / header.recordDuration))
       const last = Math.min(header.recordCount - 1,
         Math.ceil((start + duration + padding) / header.recordDuration) - 1)

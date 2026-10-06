@@ -1,4 +1,6 @@
 import type { ImportedAnnotation } from './edfAnnotations'
+import { parseHeader } from './edf'
+import { uploadTrends } from './uploadTrends'
 
 type UploadMessage =
   | { type: 'ready'; header: ArrayBuffer; name: string; size: number; totalRecords: number;
@@ -48,10 +50,12 @@ function sendChunk(id: string, offset: number, data: ArrayBuffer,
 export async function convertAndUpload(file: File,
   onProgress: (progress: UploadProgress) => void): Promise<{ name: string; size: number }> {
   const worker = new Worker(new URL('./upload.worker.ts', import.meta.url), { type: 'module' })
+  let trends: ReturnType<typeof uploadTrends> | null = null
   let uploadId: string | null = null
   try {
     const ready = await requestWorker(worker, { type: 'start', file })
     if (ready.type !== 'ready') throw new Error('Conversion did not provide an EDF header')
+    trends = uploadTrends(parseHeader(new Uint8Array(ready.header), ready.size))
     const suffix = `${ready.downsampled ? '-256hz' : ''}${ready.discontinuous ? '-continuous' : ''}`
     const name = suffix ? ready.name.replace(/\.(edf|bdf)$/i, `${suffix}.$1`) : ready.name
     const session = await responseJson(await fetch(`/api/uploads?name=${encodeURIComponent(name)}&size=${ready.size}`, {
@@ -79,6 +83,7 @@ export async function convertAndUpload(file: File,
     onProgress({ uploaded: 0, total: ready.size, speed: 0 })
     await send(ready.header)
     let annotations: ImportedAnnotation[] = []
+    let firstRecord = 0
     while (true) {
       const message = await requestWorker(worker, { type: 'next' })
       if (message.type === 'done') {
@@ -87,14 +92,18 @@ export async function convertAndUpload(file: File,
       }
       if (message.type !== 'chunk') throw new Error('Conversion stopped unexpectedly')
       await send(message.data)
+      await trends.append(firstRecord, message.data)
+      firstRecord = message.completedRecords
     }
     const result = await responseJson(await fetch(`/api/uploads/${uploadId}/complete`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(annotations),
     }))
     uploadId = null
+    try { await trends.save(String(result.name)) } catch {}
     return { name: String(result.name), size: Number(result.size) }
   } finally {
     worker.terminate()
+    trends?.terminate()
     if (uploadId) void fetch(`/api/uploads/${uploadId}`, { method: 'DELETE' }).catch(() => {})
   }
 }

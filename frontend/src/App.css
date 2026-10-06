@@ -28,6 +28,14 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .settings-bar { min-height: 29px; padding: 2px 8px; gap: 5px 7px; flex-wrap: wrap; border-bottom: 1px solid #e7eaf0; }
 .control-group { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; color: #374255; }
 .control-group select { height: 24px; max-width: 115px; border: 1px solid #d4e2f1; background: #fff; border-radius: 0; padding: 1px 3px; color: #39495e; font-size: inherit; }
+.filter-toggle { display: flex; align-items: center; width: 32px; height: 20px; flex: none; padding: 3px; border: 1px solid #aab7c8; border-radius: 0; background: #fff; }
+.filter-toggle::before { content: ''; width: 12px; height: 12px; flex: none; background: #aab7c8; transition: transform .15s ease; }
+.filter-toggle[aria-checked=true] { border-color: #405d88; }
+.filter-toggle[aria-checked=true]::before { background: #405d88; transform: translateX(12px); }
+.filter-toggle:focus-visible { outline: 1px solid #374255; outline-offset: 2px; }
+.filter-setting { display: inline-flex; align-items: center; }
+.settings-bar[data-filters-enabled=false] .filter-setting { opacity: .4; }
+.settings-separator { width: 1px; height: 20px; flex: none; margin: 0 4px; background: #d5d9e0; }
 .editable-field { position: relative; display: inline-flex; }
 .editable-field input { height: 24px; padding: 1px 3px; border: 1px solid #d4e2f1; border-right: 0; border-radius: 0; color: #39495e; font-size: inherit; font-variant-numeric: tabular-nums; }
 .editable-field input[aria-invalid=true] { border-color: #cb6464; }

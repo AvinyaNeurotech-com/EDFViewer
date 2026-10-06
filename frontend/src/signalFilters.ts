@@ -1,3 +1,7 @@
+import { auxiliaryKind } from './montage'
+import type { ChannelSelection } from './montage'
+import type { EdfHeader } from './edf'
+
 export type FilterSettings = {
   highpass: number | null
   lowpass: number | null
@@ -6,6 +10,24 @@ export type FilterSettings = {
 }
 
 export const NO_FILTERS: FilterSettings = { highpass: null, lowpass: null, notch: null, order: 2 }
+
+export type FilterType = 'eeg' | 'ecg' | 'aux'
+export type ChannelFilters = Record<FilterType, FilterSettings>
+
+export function filterType(header: EdfHeader, channel: ChannelSelection): FilterType {
+  if (typeof channel !== 'number') return 'eeg'
+  const label = header.signals[channel].label
+  const kind = auxiliaryKind(label)
+  if (kind === 'ecg') return 'ecg'
+  if (kind) return 'aux'
+  const electrode = label.trim().toUpperCase().replace(/^EEG\s+/, '').split(/[\s-]/)[0]
+  return /^(?:(?:FP|AF|FT|FC|CP|PO|TP|F|C|P|O|T|A|M)\d{1,2}|(?:FP|AF|FC|CP|PO|F|C|P|O)Z)$/.test(electrode)
+    ? 'eeg' : 'aux'
+}
+
+export function channelFilters(header: EdfHeader, channel: ChannelSelection, filters: ChannelFilters): FilterSettings {
+  return filters[filterType(header, channel)]
+}
 
 export function canFilterSamples(rate: number, settings: FilterSettings): boolean {
   return [settings.highpass, settings.lowpass, settings.notch]

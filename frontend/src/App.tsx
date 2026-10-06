@@ -17,7 +17,8 @@ import type { EdfHeader, Trace } from './edf'
 import { auxiliaryKind, czMontage, laplacianMontage, longitudinalMontage, orderedChannels,
   selectionInputs, transverseMontage } from './montage'
 import type { ChannelSelection } from './montage'
-import type { FilterSettings } from './signalFilters'
+import { filterType, NO_FILTERS } from './signalFilters'
+import type { ChannelFilters, FilterSettings, FilterType } from './signalFilters'
 import type { SpectralResult } from './spectral'
 import type { ArtifactBox } from './artifactDetection'
 import { rowTop, SPECTRAL_HEIGHT } from './waveformRender'
@@ -26,7 +27,7 @@ import './App.css'
 type Recording = { name: string; size: number }
 type WindowData = { requestId: number; start: number; duration: number; columns: number; traces: Trace[] }
 type WindowRequest = { type: 'window'; requestId: number; start: number; duration: number;
-  columns: number; channels: ChannelSelection[]; filters: FilterSettings }
+  columns: number; channels: ChannelSelection[]; filters: ChannelFilters }
 type Panel = 'annotations' | 'channels' | 'trends' | null
 type AnnotationDraft = { anchor: number; end: number; pointerId: number; start: number; duration: number }
 type SpectrumDraft = SpectrumSelection & { pointerId: number }
@@ -45,16 +46,34 @@ const defaultDisplay: DisplaySettings = {
   sensitivity: 50, rowHeight: 24, centered: true, inverted: false, grid: true,
 }
 const defaultFilters: FilterSettings = { highpass: 1, lowpass: 70, notch: 50, order: 4 }
+const defaultEcgFilters: FilterSettings = { ...defaultFilters, highpass: 2 }
+type FilterGroup = { enabled: boolean; settings: FilterSettings }
+type FilterGroups = Record<FilterType, FilterGroup>
+const defaultFilterGroups = (): FilterGroups => ({
+  eeg: { enabled: true, settings: { ...defaultFilters } },
+  ecg: { enabled: true, settings: { ...defaultEcgFilters } },
+  aux: { enabled: false, settings: { ...defaultFilters } },
+})
 
-function filtersForRecording(header: EdfHeader): FilterSettings {
-  const maxNyquist = Math.max(...header.visibleSignals.map((index) =>
+function filtersForRecording(header: EdfHeader, indices: number[], defaults: FilterSettings): FilterSettings {
+  if (!indices.length) return { ...defaults }
+  const maxNyquist = Math.max(...indices.map((index) =>
     header.signals[index].samplesPerRecord / header.recordDuration / 2))
   return {
-    highpass: maxNyquist > 1 ? 1 : null,
-    lowpass: maxNyquist > 70 ? 70 : null,
-    notch: maxNyquist > 50 ? 50 : null,
-    order: 4,
+    highpass: defaults.highpass !== null && maxNyquist > defaults.highpass ? defaults.highpass : null,
+    lowpass: defaults.lowpass !== null && maxNyquist > defaults.lowpass ? defaults.lowpass : null,
+    notch: defaults.notch !== null && maxNyquist > defaults.notch ? defaults.notch : null,
+    order: defaults.order,
   }
+}
+
+function filterGroupsForRecording(header: EdfHeader): FilterGroups {
+  const groups = defaultFilterGroups()
+  for (const type of ['eeg', 'ecg', 'aux'] as const) {
+    groups[type].settings = filtersForRecording(header,
+      header.visibleSignals.filter((index) => filterType(header, index) === type), groups[type].settings)
+  }
+  return groups
 }
 
 function nextZoomWindow(seconds: number, direction: number): number {
@@ -89,7 +108,14 @@ function App() {
   const [activeRequestId, setActiveRequestId] = useState(0)
   const [montage, setMontage] = useState<'original' | 'longitudinal' | 'transverse' | 'cz' | 'laplacian'>('original')
   const [hiddenChannels, setHiddenChannels] = useState<number[]>([])
-  const [filters, setFilters] = useState<FilterSettings>(defaultFilters)
+  const [filterGroups, setFilterGroups] = useState<FilterGroups>(defaultFilterGroups)
+  const [selectedFilterType, setSelectedFilterType] = useState<FilterType>('eeg')
+  const filters = useMemo<ChannelFilters>(() => ({
+    eeg: filterGroups.eeg.enabled ? filterGroups.eeg.settings : NO_FILTERS,
+    ecg: filterGroups.ecg.enabled ? filterGroups.ecg.settings : NO_FILTERS,
+    aux: filterGroups.aux.enabled ? filterGroups.aux.settings : NO_FILTERS,
+  }), [filterGroups])
+  const selectedFilters = filterGroups[selectedFilterType]
   const [display, setDisplay] = useState<DisplaySettings>(defaultDisplay)
   const [channelSensitivityOffsets, setChannelSensitivityOffsets] = useState<Record<string, number>>({})
   const [mutedChannelKeys, setMutedChannelKeys] = useState<string[]>([])
@@ -177,7 +203,8 @@ function App() {
       const message = event.data
       if (message.type === 'opened') {
         setHeader(message.header)
-        setFilters(filtersForRecording(message.header))
+        setFilterGroups(filterGroupsForRecording(message.header))
+        setSelectedFilterType('eeg')
       }
       if (message.type === 'window') {
         if (message.requestId !== requestIdRef.current) return
@@ -222,8 +249,8 @@ function App() {
     ? `signal:${channel}` : 'neighbors' in channel
       ? `lap:${channel.source}:${channel.neighbors.join(':')}` : `pair:${channel.source}:${channel.reference}`), [channels])
   const shownAnnotations = annotations.filter((annotation) => annotation.label.toLowerCase().includes(annotationSearch.toLowerCase()))
-  const maxNyquist = header && channels.length ? Math.max(...channels.map((channel) => {
-    const index = typeof channel === 'number' ? channel : channel.source
+  const maxNyquist = header ? Math.max(0, ...header.visibleSignals.filter((index) =>
+    filterType(header, index) === selectedFilterType).map((index) => {
     return header.signals[index].samplesPerRecord / header.recordDuration / 2
   })) : 0
   const duration = header ? Math.min(windowSeconds, header.duration) : windowSeconds
@@ -318,7 +345,8 @@ function App() {
     setEditingAnnotation(null)
     cancelAnnotationEdit()
     setAnnotationSearch('')
-    setFilters(defaultFilters)
+    setFilterGroups(defaultFilterGroups())
+    setSelectedFilterType('eeg')
     setChannelSensitivityOffsets({})
     setMutedChannelKeys([])
     setSpectrumSelection(null)
@@ -371,20 +399,24 @@ function App() {
   }, [header, maxStart, start, cancelAnnotationEdit])
 
   function filterControl(key: FilterKey, label: string) {
+    const settings = selectedFilters.settings
     const options = filterPresets[key].filter((frequency) => frequency < maxNyquist &&
-      (key === 'highpass' ? filters.lowpass === null || frequency < filters.lowpass :
-        key === 'lowpass' ? filters.highpass === null || frequency > filters.highpass : true))
-    return <EditablePreset label={label} value={filters[key]} presets={options} allowOff unit="Hz"
-      disabled={!header || !channels.length}
-      onCommit={(value) => setFilters((previous) => ({ ...previous, [key]: value }))}
+      (key === 'highpass' ? settings.lowpass === null || frequency < settings.lowpass :
+        key === 'lowpass' ? settings.highpass === null || frequency > settings.highpass : true))
+    return <span className="filter-setting" key={`${selectedFilterType}-${key}`}><EditablePreset label={label} value={settings[key]} presets={options} allowOff unit="Hz"
+      disabled={!header || !selectedFilters.enabled || !maxNyquist}
+      onCommit={(value) => setFilterGroups((previous) => ({ ...previous,
+        [selectedFilterType]: { ...previous[selectedFilterType], settings: {
+          ...previous[selectedFilterType].settings, [key]: value } },
+      }))}
       validate={(value) => {
         if (value < 0.05 || value >= maxNyquist) return `Enter 0.05 Hz to below ${maxNyquist} Hz.`
-        if (key === 'highpass' && filters.lowpass !== null && value >= filters.lowpass)
-          return `LFF must be below HFF (${filters.lowpass} Hz).`
-        if (key === 'lowpass' && filters.highpass !== null && value <= filters.highpass)
-          return `HFF must be above LFF (${filters.highpass} Hz).`
+        if (key === 'highpass' && settings.lowpass !== null && value >= settings.lowpass)
+          return `LFF must be below HFF (${settings.lowpass} Hz).`
+        if (key === 'lowpass' && settings.highpass !== null && value <= settings.highpass)
+          return `HFF must be above LFF (${settings.highpass} Hz).`
         return null
-      }} />
+      }} /></span>
   }
 
   function changeWindow(seconds: number) {
@@ -614,15 +646,28 @@ function App() {
       </button>
     </header>
 
-    {selected && <div className="settings-bar" id="viewer-settings">
+    {selected && <div className="settings-bar" id="viewer-settings" data-filters-enabled={selectedFilters.enabled}>
+      <label className="control-group">Filter type <select aria-label="Filter type" value={selectedFilterType}
+        onChange={(event) => { setSelectedFilterType(event.target.value as FilterType); event.currentTarget.blur() }}>
+        <option value="eeg">EEG</option><option value="ecg">ECG</option><option value="aux">AUX</option>
+      </select></label>
+      <button className="filter-toggle" type="button" role="switch" aria-label={`${selectedFilterType.toUpperCase()} filters`}
+        aria-checked={selectedFilters.enabled} disabled={!header}
+        onClick={() => setFilterGroups((previous) => ({ ...previous,
+          [selectedFilterType]: { ...previous[selectedFilterType], enabled: !previous[selectedFilterType].enabled },
+        }))} />
       {filterControl('highpass', 'LFF')}
       {filterControl('lowpass', 'HFF')}
       {filterControl('notch', 'Notch')}
-      <label className="control-group">Slope <select aria-label="Filter order" value={filters.order}
-        disabled={!channels.length}
-        onChange={(event) => setFilters((previous) => ({ ...previous, order: Number(event.target.value) as 2 | 4 }))}>
+      <label className="control-group filter-setting">Slope <select aria-label="Filter order" value={selectedFilters.settings.order}
+        disabled={!header || !selectedFilters.enabled || !maxNyquist}
+        onChange={(event) => setFilterGroups((previous) => ({ ...previous,
+          [selectedFilterType]: { ...previous[selectedFilterType], settings: {
+            ...previous[selectedFilterType].settings, order: Number(event.target.value) as 2 | 4 } },
+        }))}>
         <option value={2}>Standard (2nd)</option><option value={4}>Steep (4th)</option>
       </select></label>
+      <span className="settings-separator" aria-hidden="true" />
       <EditablePreset label="Sensitivity" value={display.sensitivity} presets={sensitivityOptions} unit="µV/div"
         onCommit={(value) => setDisplay((current) => ({ ...current, sensitivity: value! }))}
         validate={(value) => value > 0 && value <= 10000 ? null : 'Enter a sensitivity above 0 and up to 10000 µV/div.'} />
@@ -675,7 +720,8 @@ function App() {
             <button type="button" aria-label="Reset display" onClick={() => {
               setDisplay(defaultDisplay)
               setChannelSensitivityOffsets({})
-              setFilters(header ? filtersForRecording(header) : defaultFilters)
+              setFilterGroups(header ? filterGroupsForRecording(header) : defaultFilterGroups())
+              setSelectedFilterType('eeg')
               setMontage('original')
               setHiddenChannels([])
               changeWindow(10)

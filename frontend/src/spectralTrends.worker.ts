@@ -3,22 +3,30 @@ import { sampleValue } from './edf'
 import type { EdfHeader } from './edf'
 import { FREQUENCIES, peakProminence, spectralPowers } from './spectralTrends'
 import type { SpectralPair, SpectralTrendChunk } from './spectralTrends'
+import { UploadTrendRecords } from './uploadTrendRecords'
 
 const CHUNK_SECONDS = 30
 const WINDOW_SECONDS = 4
 let advance: (() => void) | null = null
 let request: AbortController | null = null
+let upload: UploadTrendRecords | null = null
 
 self.onmessage = async (event: MessageEvent<
-  { name: string; header: EdfHeader; pairs: SpectralPair[]; start: number } | { type: 'continue' | 'pause' }>) => {
+  { name?: string; header: EdfHeader; pairs: SpectralPair[]; start: number; type?: 'upload' } |
+  { type: 'data'; first: number; data: ArrayBuffer } | { type: 'continue' | 'pause' }>) => {
   if ('type' in event.data) {
+    if (event.data.type === 'data') { upload?.append(event.data.first, event.data.data); return }
     if (event.data.type === 'pause') {
       request?.abort()
-    } else {
-      advance?.()
+      return
     }
-    return
+    if (event.data.type === 'continue') {
+      advance?.()
+      return
+    }
   }
+  if (!('header' in event.data)) return
+  upload = event.data.type === 'upload' ? new UploadTrendRecords(event.data.header.recordBytes) : null
   const { name, header, pairs } = event.data
   const previous = [new Float64Array(FREQUENCIES).fill(NaN), new Float64Array(FREQUENCIES).fill(NaN)]
   try {
@@ -30,23 +38,26 @@ self.onmessage = async (event: MessageEvent<
         Math.ceil((end + WINDOW_SECONDS) / header.recordDuration) - 1)
       const byteStart = header.headerBytes + firstRecord * header.recordBytes
       const byteEnd = header.headerBytes + (lastRecord + 1) * header.recordBytes - 1
-      request = new AbortController()
       let bytes: ArrayBuffer
-      try {
-        const response = await fetch(`/api/recordings/${encodeURIComponent(name)}/file`, {
-          headers: { Range: `bytes=${byteStart}-${byteEnd}` }, priority: 'low', signal: request.signal,
-        })
-        if (response.status !== 206) throw new Error(`Expected EDF byte-range response, got ${response.status}`)
-        bytes = await response.arrayBuffer()
-      } catch (error) {
-        if (!request.signal.aborted) throw error
-        self.postMessage({ type: 'paused' })
-        await new Promise<void>((resolve) => { advance = resolve })
-        advance = null
-        start -= CHUNK_SECONDS
-        continue
-      } finally {
-        request = null
+      if (upload) bytes = await upload.read(firstRecord, lastRecord)
+      else {
+        request = new AbortController()
+        try {
+          const response = await fetch(`/api/recordings/${encodeURIComponent(name!)}/file`, {
+            headers: { Range: `bytes=${byteStart}-${byteEnd}` }, priority: 'low', signal: request.signal,
+          })
+          if (response.status !== 206) throw new Error(`Expected EDF byte-range response, got ${response.status}`)
+          bytes = await response.arrayBuffer()
+        } catch (error) {
+          if (!request.signal.aborted) throw error
+          self.postMessage({ type: 'paused' })
+          await new Promise<void>((resolve) => { advance = resolve })
+          advance = null
+          start -= CHUNK_SECONDS
+          continue
+        } finally {
+          request = null
+        }
       }
       if (bytes.byteLength !== byteEnd - byteStart + 1) throw new Error('Incomplete spectral trend data range')
       const view = new DataView(bytes)
@@ -116,7 +127,7 @@ self.onmessage = async (event: MessageEvent<
       if (start >= event.data.start) self.postMessage({ type: 'chunk', chunk }, {
         transfer: [chunk.asymmetry.buffer, ...chunk.rhythm.map((values) => values.buffer)],
       })
-      if (start >= event.data.start) {
+      if (start >= event.data.start && !upload) {
         await new Promise<void>((resolve) => { advance = resolve })
         advance = null
       }
