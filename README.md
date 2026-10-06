@@ -14,6 +14,29 @@ uv run uvicorn backend:app --reload
 
 The API runs at `http://127.0.0.1:8000`. `GET /api/recordings` lists files; `GET /api/recordings/{name}/file` supports standard `Range: bytes=...` requests. `GET /api/health` is a health check. Recordings are excluded from Git.
 
+### Azure Files (optional)
+
+The POC can use the private Azure Files share `testfileshare` on storage account `teststorageavinya` without changing the frontend or setting `EDF_DIR`: mount the share over the **empty** `backend/recordings` directory before starting the API. On Linux, install `cifs-utils` if `mount.cifs` is missing. The machine must be able to reach the share over TCP port 445. Do not put the account key in the repository or shell command history.
+
+```bash
+cd /path/to/EDFViewer
+sudo install -d -m 700 /etc/smbcredentials
+sudo install -m 600 /dev/null /etc/smbcredentials/teststorageavinya.cred
+sudoedit /etc/smbcredentials/teststorageavinya.cred
+```
+
+Enter `username=teststorageavinya` and `password=<storage account key>` on separate lines in that root-owned credentials file. Then mount and verify it (on the VM use the backend service user's UID/GID instead of your own):
+
+```bash
+sudo mount -t cifs //teststorageavinya.file.core.windows.net/testfileshare \
+  "$(pwd)/backend/recordings" \
+  -o vers=3.1.1,credentials=/etc/smbcredentials/teststorageavinya.cred,uid=$(id -u),gid=$(id -g),file_mode=0660,dir_mode=0770
+findmnt -T "$(pwd)/backend/recordings"
+touch backend/recordings/.write-test && rm backend/recordings/.write-test
+```
+
+Start the backend only after confirming that `findmnt` shows `cifs`; otherwise it will write to the underlying local directory. Mounting over a nonempty directory hides its files until the share is unmounted. For a VM, set up the mount at boot and make the backend service depend on it. Keep one backend process for this POC: upload sessions and trend-save locks are process-local. All recordings, annotation JSON and saved trend binaries then live on the share; range requests continue through the backend, so Azure Files CORS is not needed. If local access to port 445 is blocked, test from the Azure VM instead.
+
 Trend results are checkpointed alongside each recording as `<name>.aeeg.v1.bin` and `<name>.spectral.v1.bin` (very long filenames use a hash of the recording name). `GET /api/recordings/{name}/trends/revision` supplies the recording size and modification-time revision; `GET` and `PUT /api/recordings/{name}/trends/{aeeg|spectral}` load/save versioned binary caches. The format is `ETR1`, a little-endian 32-bit JSON header length, UTF-8 metadata (kind, revision, selected pairs, epoch count), then little-endian float32 values. aEEG stores time/lower/upper per pair per epoch; spectral trends store 25 frequency bins each of asymmetry, left rhythm and right rhythm per epoch. Each trend saves its accumulated epochs at roughly 5% or 300-second intervals (whichever comes first), on completion, and when switching recordings. Opening a partial trend restores its existing data and resumes at the next 30-second chunk; the spectral worker recomputes the preceding chunk to restore its rhythm boundary state. A tab or browser that closes abruptly can lose work since the last successful checkpoint; a failed save does not stop computation. Older checkpoints cannot replace newer ones, and stale revisions are recomputed. Uploads are size-limited and atomically replaced. This is a cache, not a backup of the original EDF/BDF.
 
 Annotations are stored beside each recording in `<name>.annotations.v1.json` (or a hashed filename for long recording names). `GET` and `PUT /api/recordings/{name}/annotations` load and save a validated JSON document. Changes are saved in order as you edit; the frontend reloads them when switching recordings or refreshing. JSON writes use an atomic replacement and are tied to the recording size and modification time. The API requires write access to `EDF_DIR` for both annotations and trend caches. Concurrent editors use last-write-wins behavior.

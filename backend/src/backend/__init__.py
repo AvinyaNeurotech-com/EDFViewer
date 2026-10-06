@@ -75,8 +75,10 @@ def publish_upload(path: Path, name: str, size: int) -> dict[str, str | int]:
     validate_uploaded_file(path, name, size)
     for attempt in range(10):
         destination = RECORDINGS_DIR / (name if attempt == 0 else f"{Path(name).stem}-{uuid4().hex[:8]}{Path(name).suffix}")
+        if os.path.lexists(destination):
+            continue
         try:
-            os.link(path, destination)
+            path.rename(destination)
             return {"name": destination.name, "size": size}
         except FileExistsError:
             continue
