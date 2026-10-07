@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field, field_validator
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 CONTAINER_NAME = os.environ.get("AZURE_STORAGE_CONTAINER", "recordings")
-MAX_UPLOAD_BYTES = 2 * 1024**3
+MAX_UPLOAD_BYTES = 4 * 1024**3
 MAX_UPLOAD_CHUNK_BYTES = 4 * 1024**2
 MAX_HEADER_BYTES = 4097 * 256
 MAX_TREND_BYTES = 128 * 1024**2
@@ -265,7 +265,7 @@ async def upload_recording(request: Request, name: str) -> dict[str, str | int]:
         async for part in request.stream():
             buffer.extend(part)
             if session.received + len(buffer) > MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=413, detail="Recording exceeds 2 GiB upload limit")
+                raise HTTPException(status_code=413, detail="Recording exceeds 4 GiB upload limit")
             if len(buffer) >= MAX_UPLOAD_CHUNK_BYTES:
                 await session.stage(bytes(buffer))
                 buffer.clear()

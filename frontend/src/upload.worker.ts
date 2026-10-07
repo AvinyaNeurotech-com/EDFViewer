@@ -161,7 +161,7 @@ async function prepare(source: File): Promise<void> {
   outputHeader.set(new TextEncoder().encode(String(header.recordCount).padEnd(8, ' ')), 236)
   outputRecordBytes = channels.reduce((total, channel) => total + channel.output * header.bytesPerSample, 0)
   const outputSize = size + header.recordCount * outputRecordBytes
-  if (!Number.isSafeInteger(outputSize) || outputSize > 2 * 1024 ** 3 ||
+  if (!Number.isSafeInteger(outputSize) || outputSize > 4 * 1024 ** 3 ||
       header.recordBytes > 4 * 1024 ** 2 || outputRecordBytes > 4 * 1024 ** 2 || size > 4 * 1024 ** 2) {
     throw new Error('Converted recording exceeds the upload size limit')
   }
