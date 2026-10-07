@@ -1,59 +1,116 @@
 import json
 import math
 import os
-import tempfile
+import re
 from asyncio import Lock
+from base64 import b64encode
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from hashlib import sha256
-from pathlib import Path
-from time import time
+from pathlib import Path, PurePosixPath
+from typing import Any
 from uuid import uuid4
 
+from azure.core import MatchConditions
+from azure.core.exceptions import (
+    HttpResponseError,
+    ResourceExistsError,
+    ResourceModifiedError,
+    ResourceNotFoundError,
+)
+from azure.storage.blob import BlobBlock, BlobProperties
+from azure.storage.blob.aio import ContainerClient
+from dotenv import load_dotenv
 from fastapi import Body, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 
-app = FastAPI(title="EDF Viewer API")
-RECORDINGS_DIR = Path(
-    os.environ.get("EDF_DIR", Path(__file__).resolve().parents[2] / "recordings")
-).resolve()
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+CONTAINER_NAME = os.environ.get("AZURE_STORAGE_CONTAINER", "recordings")
 MAX_UPLOAD_BYTES = 2 * 1024**3
 MAX_UPLOAD_CHUNK_BYTES = 4 * 1024**2
+MAX_HEADER_BYTES = 4097 * 256
 MAX_TREND_BYTES = 128 * 1024**2
 TREND_KINDS = {"aeeg", "spectral"}
 TREND_MAGIC = b"ETR1"
+RANGE_PATTERN = re.compile(r"bytes=(\d*)-(\d*)")
 UPLOADS: dict[str, "UploadSession"] = {}
 TREND_SAVE_LOCK = Lock()
+container: ContainerClient
+
+
+def container_client() -> tuple[ContainerClient, Any]:
+    """Connect with AZURE_STORAGE_CONNECTION_STRING, or AZURE_STORAGE_ACCOUNT_URL plus Entra ID credentials."""
+    connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+    if connection_string:
+        return ContainerClient.from_connection_string(connection_string, CONTAINER_NAME), None
+    account_url = os.environ.get("AZURE_STORAGE_ACCOUNT_URL")
+    if not account_url:
+        raise RuntimeError("Set AZURE_STORAGE_CONNECTION_STRING or AZURE_STORAGE_ACCOUNT_URL")
+    from azure.identity.aio import DefaultAzureCredential
+
+    credential = DefaultAzureCredential()
+    return ContainerClient(account_url, CONTAINER_NAME, credential=credential), credential
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    global container
+    client, credential = container_client()
+    try:
+        async with client:
+            if not await client.exists():
+                try:
+                    await client.create_container()
+                except ResourceExistsError:
+                    pass
+            container = client
+            yield
+    finally:
+        if credential is not None:
+            await credential.close()
+
+
+app = FastAPI(title="EDF Viewer API", lifespan=lifespan)
 
 
 @dataclass
 class UploadSession:
-    path: Path
+    """Blocks are staged on the final blob name and only become visible when the block list is committed."""
     name: str
     expected_size: int
     received: int = 0
+    header: bytearray = field(default_factory=bytearray)
+    blocks: list[BlobBlock] = field(default_factory=list)
     lock: Lock = field(default_factory=Lock)
+
+    async def stage(self, chunk: bytes) -> None:
+        block_id = b64encode(f"{uuid4().hex}-{len(self.blocks):06d}".encode()).decode()
+        await container.get_blob_client(self.name).stage_block(block_id, chunk, length=len(chunk))
+        self.blocks.append(BlobBlock(block_id))
+        if len(self.header) < MAX_HEADER_BYTES:
+            self.header.extend(chunk[:MAX_HEADER_BYTES - len(self.header)])
+        self.received += len(chunk)
 
 
 def valid_upload_name(name: str) -> bool:
-    return bool(name) and name == Path(name).name and "\\" not in name and not name.startswith(".") and (
-        len(name.encode("utf-8")) <= 240 and Path(name).suffix.lower() in {".edf", ".bdf"}
+    return bool(name) and name == PurePosixPath(name).name and "\\" not in name and not name.startswith(".") and (
+        len(name.encode("utf-8")) <= 240 and PurePosixPath(name).suffix.lower() in {".edf", ".bdf"}
     )
 
 
-def validate_uploaded_file(path: Path, name: str, size: int) -> None:
-    with path.open("rb") as uploaded:
-        header = uploaded.read(256)
-        if len(header) < 256:
-            raise HTTPException(status_code=400, detail="Incomplete EDF/BDF header")
-        signal_count = int(header[252:256].strip() or b"0") if header[252:256].strip().isdigit() else 0
-        header_size = int(header[184:192].strip() or b"0") if header[184:192].strip().isdigit() else 0
-        expected_prefix = b"\xffBIOSEMI" if name.lower().endswith(".bdf") else b"0       "
-        if not header.startswith(expected_prefix) or not 1 <= signal_count <= 4096 or header_size != (signal_count + 1) * 256:
-            raise HTTPException(status_code=400, detail="Invalid EDF/BDF header")
-        uploaded.seek(0)
-        full_header = uploaded.read(header_size)
+def validate_uploaded_header(full_header: bytes, name: str, size: int) -> None:
+    header = full_header[:256]
+    if len(header) < 256:
+        raise HTTPException(status_code=400, detail="Incomplete EDF/BDF header")
+    signal_count = int(header[252:256].strip() or b"0") if header[252:256].strip().isdigit() else 0
+    header_size = int(header[184:192].strip() or b"0") if header[184:192].strip().isdigit() else 0
+    expected_prefix = b"\xffBIOSEMI" if name.lower().endswith(".bdf") else b"0       "
+    if not header.startswith(expected_prefix) or not 1 <= signal_count <= 4096 or header_size != (signal_count + 1) * 256:
+        raise HTTPException(status_code=400, detail="Invalid EDF/BDF header")
+    full_header = full_header[:header_size]
     if len(full_header) != header_size:
         raise HTTPException(status_code=400, detail="Incomplete EDF/BDF header")
     try:
@@ -71,16 +128,28 @@ def validate_uploaded_file(path: Path, name: str, size: int) -> None:
         raise HTTPException(status_code=400, detail="Incomplete EDF/BDF data records")
 
 
-def publish_upload(path: Path, name: str, size: int) -> dict[str, str | int]:
-    validate_uploaded_file(path, name, size)
+async def blob_exists(name: str) -> bool:
+    return await container.get_blob_client(name).exists()
+
+
+async def allocate_recording_name(name: str) -> str:
+    reserved = {session.name for session in UPLOADS.values()}
     for attempt in range(10):
-        destination = RECORDINGS_DIR / (name if attempt == 0 else f"{Path(name).stem}-{uuid4().hex[:8]}{Path(name).suffix}")
-        try:
-            os.link(path, destination)
-            return {"name": destination.name, "size": size}
-        except FileExistsError:
-            continue
+        candidate = name if attempt == 0 else f"{PurePosixPath(name).stem}-{uuid4().hex[:8]}{PurePosixPath(name).suffix}"
+        if candidate not in reserved and not await blob_exists(candidate):
+            return candidate
     raise HTTPException(status_code=409, detail="Could not allocate a unique recording name")
+
+
+async def publish_upload(session: UploadSession) -> dict[str, str | int]:
+    validate_uploaded_header(bytes(session.header), session.name, session.received)
+    try:
+        await container.get_blob_client(session.name).commit_block_list(
+            session.blocks, match_condition=MatchConditions.IfMissing
+        )
+    except (ResourceExistsError, ResourceModifiedError):
+        raise HTTPException(status_code=409, detail="A recording with this name was just created; upload again") from None
+    return {"name": session.name, "size": session.received}
 
 
 class Annotation(BaseModel):
@@ -104,35 +173,41 @@ class AnnotationDocument(BaseModel):
     annotations: list[Annotation] = Field(max_length=10000)
 
 
-def recording_path(name: str) -> Path:
-    file = RECORDINGS_DIR / name
-    if (
-        name != Path(name).name
-        or file.suffix.lower() not in {".edf", ".bdf"}
-        or file.is_symlink()
-        or not file.is_file()
-    ):
+def valid_recording_name(name: str) -> bool:
+    return name == PurePosixPath(name).name and "\\" not in name and (
+        PurePosixPath(name).suffix.lower() in {".edf", ".bdf"}
+    )
+
+
+async def recording_properties(name: str) -> BlobProperties:
+    if not valid_recording_name(name):
         raise HTTPException(status_code=404, detail="Recording not found")
-    return file
+    try:
+        return await container.get_blob_client(name).get_blob_properties()
+    except ResourceNotFoundError:
+        raise HTTPException(status_code=404, detail="Recording not found") from None
 
 
-def recording_revision(file: Path) -> str:
-    stat = file.stat()
-    return f"{stat.st_size}:{stat.st_mtime_ns}"
+def recording_revision(properties: BlobProperties) -> str:
+    return f"{properties.size}:{str(properties.etag).strip('"')}"
 
 
-def trend_path(file: Path, kind: str) -> Path:
+async def current_revision(name: str) -> str:
+    return recording_revision(await recording_properties(name))
+
+
+def sidecar_name(name: str, suffix: str) -> str:
+    return f"{name if len((name + suffix).encode()) <= 255 else sha256(name.encode()).hexdigest()}{suffix}"
+
+
+def trend_name(name: str, kind: str) -> str:
     if kind not in TREND_KINDS:
         raise HTTPException(status_code=404, detail="Trend not found")
-    suffix = f".{kind}.v1.bin"
-    filename = file.name if len((file.name + suffix).encode()) <= 255 else sha256(file.name.encode()).hexdigest()
-    return file.with_name(f"{filename}{suffix}")
+    return sidecar_name(name, f".{kind}.v1.bin")
 
 
-def annotation_path(file: Path) -> Path:
-    suffix = ".annotations.v1.json"
-    filename = file.name if len((file.name + suffix).encode()) <= 255 else sha256(file.name.encode()).hexdigest()
-    return file.with_name(f"{filename}{suffix}")
+def annotation_name(name: str) -> str:
+    return sidecar_name(name, ".annotations.v1.json")
 
 
 def trend_header(data: bytes, kind: str, revision: str) -> dict:
@@ -156,22 +231,26 @@ def trend_header(data: bytes, kind: str, revision: str) -> dict:
     return metadata
 
 
+async def read_limited(request: Request, limit: int, detail: str) -> bytes:
+    data = bytearray()
+    async for part in request.stream():
+        data.extend(part)
+        if len(data) > limit:
+            raise HTTPException(status_code=413, detail=detail)
+    return bytes(data)
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.get("/api/recordings")
-def recordings() -> list[dict[str, str | int]]:
-    if not RECORDINGS_DIR.is_dir():
-        return []
-
+async def recordings() -> list[dict[str, str | int]]:
     return [
-        {"name": file.name, "size": file.stat().st_size}
-        for file in sorted(RECORDINGS_DIR.iterdir())
-        if file.is_file()
-        and not file.is_symlink()
-        and file.suffix.lower() in {".edf", ".bdf"}
+        {"name": blob.name, "size": blob.size}
+        async for blob in container.list_blobs()
+        if not blob.name.startswith(".") and valid_recording_name(blob.name)
     ]
 
 
@@ -179,43 +258,32 @@ def recordings() -> list[dict[str, str | int]]:
 async def upload_recording(request: Request, name: str) -> dict[str, str | int]:
     if not valid_upload_name(name):
         raise HTTPException(status_code=400, detail="Choose an .edf or .bdf filename")
-
-    RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path | None = None
+    upload_id = uuid4().hex
+    session = UPLOADS[upload_id] = UploadSession(await allocate_recording_name(name), MAX_UPLOAD_BYTES)
     try:
-        with tempfile.NamedTemporaryFile(
-            dir=RECORDINGS_DIR, prefix=".upload-", suffix=".part", delete=False
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-            size = 0
-            async for chunk in request.stream():
-                size += len(chunk)
-                if size > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="Recording exceeds 2 GiB upload limit")
-                temporary.write(chunk)
-
-        return publish_upload(temporary_path, name, size)
+        buffer = bytearray()
+        async for part in request.stream():
+            buffer.extend(part)
+            if session.received + len(buffer) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="Recording exceeds 2 GiB upload limit")
+            if len(buffer) >= MAX_UPLOAD_CHUNK_BYTES:
+                await session.stage(bytes(buffer))
+                buffer.clear()
+        if buffer:
+            await session.stage(bytes(buffer))
+        return await publish_upload(session)
     finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+        UPLOADS.pop(upload_id, None)
 
 
 @app.post("/api/uploads", status_code=201)
-def create_upload(name: str, size: int) -> dict[str, str]:
+async def create_upload(name: str, size: int) -> dict[str, str]:
     if not valid_upload_name(name) or not 0 < size <= MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=400, detail="Invalid recording name or size")
     if len(UPLOADS) >= 8:
         raise HTTPException(status_code=429, detail="Too many active uploads")
-    RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-    for stale in RECORDINGS_DIR.glob(".upload-*.part"):
-        if stale.is_file() and stale.stat().st_mtime < time() - 86400 and all(
-            session.path != stale for session in UPLOADS.values()
-        ):
-            stale.unlink(missing_ok=True)
-    with tempfile.NamedTemporaryFile(dir=RECORDINGS_DIR, prefix=".upload-", suffix=".part", delete=False) as temporary:
-        path = Path(temporary.name)
     upload_id = uuid4().hex
-    UPLOADS[upload_id] = UploadSession(path, name, size)
+    UPLOADS[upload_id] = UploadSession(await allocate_recording_name(name), size)
     return {"id": upload_id}
 
 
@@ -236,9 +304,7 @@ async def append_upload(upload_id: str, offset: int, request: Request) -> None:
                 raise HTTPException(status_code=413, detail="Upload chunk exceeds limit")
         if not chunk:
             raise HTTPException(status_code=400, detail="Empty upload chunk")
-        with session.path.open("ab") as output:
-            output.write(chunk)
-        session.received += len(chunk)
+        await session.stage(bytes(chunk))
 
 
 @app.post("/api/uploads/{upload_id}/complete", status_code=201)
@@ -251,132 +317,141 @@ async def complete_upload(upload_id: str, annotations: list[Annotation] = Body(d
             raise HTTPException(status_code=404, detail="Upload not found")
         if session.received != session.expected_size:
             raise HTTPException(status_code=409, detail="Upload incomplete")
-        destination: Path | None = None
+        published = False
         try:
-            result = publish_upload(session.path, session.name, session.received)
-            destination = RECORDINGS_DIR / str(result["name"])
+            result = await publish_upload(session)
+            published = True
             if annotations:
-                document = AnnotationDocument(revision=recording_revision(destination), annotations=annotations)
-                with tempfile.NamedTemporaryFile(dir=RECORDINGS_DIR, prefix=".annotations-", delete=False) as temporary:
-                    temporary_path = Path(temporary.name)
-                    try:
-                        temporary.write(document.model_dump_json().encode("utf-8"))
-                        os.replace(temporary_path, annotation_path(destination))
-                    finally:
-                        temporary_path.unlink(missing_ok=True)
+                document = AnnotationDocument(revision=await current_revision(session.name), annotations=annotations)
+                await container.get_blob_client(annotation_name(session.name)).upload_blob(
+                    document.model_dump_json().encode("utf-8"), overwrite=True
+                )
             return result
         except Exception:
-            if destination is not None:
-                destination.unlink(missing_ok=True)
+            if published:
+                await container.get_blob_client(session.name).delete_blob()
             raise
         finally:
-            session.path.unlink(missing_ok=True)
             UPLOADS.pop(upload_id, None)
 
 
 @app.delete("/api/uploads/{upload_id}", status_code=204)
 async def cancel_upload(upload_id: str) -> None:
+    # Staged blocks that are never committed are discarded by Blob Storage after seven days.
     session = UPLOADS.get(upload_id)
     if session is None:
         return
     async with session.lock:
-        if UPLOADS.get(upload_id) is not session:
-            return
-        session.path.unlink(missing_ok=True)
-        UPLOADS.pop(upload_id, None)
+        if UPLOADS.get(upload_id) is session:
+            UPLOADS.pop(upload_id, None)
 
 
 @app.get("/api/recordings/{name}/file")
-def recording_file(name: str) -> FileResponse:
-    return FileResponse(recording_path(name), media_type="application/octet-stream")
+async def recording_file(name: str, request: Request) -> Response:
+    if not valid_recording_name(name):
+        raise HTTPException(status_code=404, detail="Recording not found")
+    blob = container.get_blob_client(name)
+    match = RANGE_PATTERN.fullmatch(request.headers.get("range", "").strip())
+    if match and not match[1] and match[2]:
+        # Suffix range ("bytes=-N") needs the blob size to resolve.
+        size = (await recording_properties(name)).size
+        start, end = max(size - int(match[2]), 0), size - 1
+        if int(match[2]) == 0 or size == 0:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+    elif match and match[1] and (not match[2] or int(match[2]) >= int(match[1])):
+        start, end = int(match[1]), int(match[2]) if match[2] else None
+    else:
+        start = end = None
+    try:
+        downloader = await blob.download_blob(
+            offset=start, length=None if start is None or end is None else end - start + 1
+        )
+    except ResourceNotFoundError:
+        raise HTTPException(status_code=404, detail="Recording not found") from None
+    except HttpResponseError as error:
+        if error.status_code == 416:
+            size = (await recording_properties(name)).size
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+        raise
+    headers = {"Accept-Ranges": "bytes", "Content-Length": str(downloader.size)}
+    if start is None:
+        return StreamingResponse(downloader.chunks(), media_type="application/octet-stream", headers=headers)
+    total = downloader.properties.content_range.rsplit("/", 1)[1]
+    if downloader.size <= 0 or start >= int(total):
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
+    headers["Content-Range"] = f"bytes {start}-{start + downloader.size - 1}/{total}"
+    return StreamingResponse(downloader.chunks(), status_code=206, media_type="application/octet-stream", headers=headers)
 
 
 @app.get("/api/recordings/{name}/annotations", response_model=AnnotationDocument)
-def get_annotations(name: str) -> AnnotationDocument:
-    file = recording_path(name)
-    revision = recording_revision(file)
-    path = annotation_path(file)
-    if path.is_symlink():
-        raise HTTPException(status_code=400, detail="Invalid annotation file")
-    if not path.exists():
+async def get_annotations(name: str) -> AnnotationDocument:
+    revision = await current_revision(name)
+    try:
+        data = await (await container.get_blob_client(annotation_name(name)).download_blob()).readall()
+    except ResourceNotFoundError:
         return AnnotationDocument(revision=revision, annotations=[])
     try:
-        document = AnnotationDocument.model_validate_json(path.read_bytes())
-    except (ValueError, OSError):
+        document = AnnotationDocument.model_validate_json(data)
+    except ValueError:
         raise HTTPException(status_code=500, detail="Unable to read annotations") from None
     return document if document.revision == revision else AnnotationDocument(revision=revision, annotations=[])
 
 
 @app.put("/api/recordings/{name}/annotations", status_code=204)
-def put_annotations(name: str, document: AnnotationDocument) -> None:
-    file = recording_path(name)
-    if document.revision != recording_revision(file):
+async def put_annotations(name: str, document: AnnotationDocument) -> None:
+    if document.revision != await current_revision(name):
         raise HTTPException(status_code=409, detail="Recording changed; reload annotations")
-    path = annotation_path(file)
-    if path.is_symlink():
-        raise HTTPException(status_code=400, detail="Invalid annotation file")
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(dir=RECORDINGS_DIR, prefix=".annotations-", delete=False) as temporary:
-            temporary_path = Path(temporary.name)
-            temporary.write(document.model_dump_json().encode("utf-8"))
-        if document.revision != recording_revision(file):
-            raise HTTPException(status_code=409, detail="Recording changed; reload annotations")
-        os.replace(temporary_path, path)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+    await container.get_blob_client(annotation_name(name)).upload_blob(
+        document.model_dump_json().encode("utf-8"), overwrite=True
+    )
 
 
 @app.get("/api/recordings/{name}/trends/revision")
-def trend_revision(name: str) -> dict[str, str]:
-    return {"revision": recording_revision(recording_path(name))}
+async def trend_revision(name: str) -> dict[str, str]:
+    return {"revision": await current_revision(name)}
 
 
 @app.get("/api/recordings/{name}/trends/{kind}")
-def get_trend(name: str, kind: str) -> FileResponse:
-    file = recording_path(name)
-    cache = trend_path(file, kind)
-    if cache.is_symlink() or not cache.is_file() or cache.stat().st_size > MAX_TREND_BYTES:
-        raise HTTPException(status_code=404, detail="Trend not cached")
+async def get_trend(name: str, kind: str) -> Response:
+    revision = await current_revision(name)
     try:
-        trend_header(cache.read_bytes(), kind, recording_revision(file))
-    except (ValueError, UnicodeDecodeError, OSError, KeyError, TypeError):
+        downloader = await container.get_blob_client(trend_name(name, kind)).download_blob()
+    except ResourceNotFoundError:
+        raise HTTPException(status_code=404, detail="Trend not cached") from None
+    if downloader.size > MAX_TREND_BYTES:
+        raise HTTPException(status_code=404, detail="Trend not cached")
+    data = await downloader.readall()
+    try:
+        trend_header(data, kind, revision)
+    except (ValueError, UnicodeDecodeError, KeyError, TypeError):
         raise HTTPException(status_code=404, detail="Trend cache invalid") from None
-    return FileResponse(cache, media_type="application/octet-stream")
+    return Response(data, media_type="application/octet-stream")
 
 
 @app.put("/api/recordings/{name}/trends/{kind}", status_code=204)
 async def put_trend(name: str, kind: str, request: Request) -> None:
-    file = recording_path(name)
-    cache = trend_path(file, kind)
-    revision = recording_revision(file)
-    temporary_path: Path | None = None
+    revision = await current_revision(name)
+    cache = container.get_blob_client(trend_name(name, kind))
+    data = await read_limited(request, MAX_TREND_BYTES, "Trend exceeds size limit")
     try:
-        with tempfile.NamedTemporaryFile(dir=RECORDINGS_DIR, prefix=".trend-", delete=False) as temporary:
-            temporary_path = Path(temporary.name)
-            size = 0
-            async for chunk in request.stream():
-                size += len(chunk)
-                if size > MAX_TREND_BYTES:
-                    raise HTTPException(status_code=413, detail="Trend exceeds size limit")
-                temporary.write(chunk)
+        new = trend_header(data, kind, revision)
+    except (ValueError, UnicodeDecodeError, KeyError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid or outdated trend cache") from None
+    async with TREND_SAVE_LOCK:
+        if await current_revision(name) != revision:
+            raise HTTPException(status_code=409, detail="Recording changed during upload")
+        condition: dict[str, Any] = {"match_condition": MatchConditions.IfMissing}
         try:
-            trend_header(temporary_path.read_bytes(), kind, revision)
+            downloader = await cache.download_blob()
+            condition = {"etag": downloader.properties.etag, "match_condition": MatchConditions.IfNotModified}
+            old = trend_header(await downloader.readall(), kind, revision)
+            if old["count"] > new["count"]:
+                raise HTTPException(status_code=409, detail="Newer trend checkpoint already saved")
+        except ResourceNotFoundError:
+            pass
         except (ValueError, UnicodeDecodeError, KeyError, TypeError):
-            raise HTTPException(status_code=400, detail="Invalid or outdated trend cache") from None
-        async with TREND_SAVE_LOCK:
-            if recording_revision(file) != revision:
-                raise HTTPException(status_code=409, detail="Recording changed during upload")
-            if cache.is_file() and not cache.is_symlink():
-                try:
-                    old = trend_header(cache.read_bytes(), kind, revision)
-                    new = trend_header(temporary_path.read_bytes(), kind, revision)
-                    if old["count"] > new["count"]:
-                        raise HTTPException(status_code=409, detail="Newer trend checkpoint already saved")
-                except (ValueError, UnicodeDecodeError, OSError, KeyError, TypeError):
-                    pass
-            os.replace(temporary_path, cache)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+            pass
+        try:
+            await cache.upload_blob(data, overwrite=True, **condition)
+        except (ResourceExistsError, ResourceModifiedError):
+            raise HTTPException(status_code=409, detail="Trend checkpoint changed during save; retry") from None
